@@ -20,7 +20,7 @@ This library provides a complete implementation of the OAuth2 authorization fram
 - **PKCE (RFC 7636)** - Enhanced security for public clients
 - **Token Management** - Save, load, and manage tokens with expiration checking
 - **Bearer Token Requests** - Easy API calls with bearer authentication
-- **Async/Sync Support** - Works with both synchronous and asynchronous HTTP clients
+- **Async/Sync Support** - Works with both synchronous and asynchronous HTTP clients via `{.multisync.}`
 - **State Validation** - Cryptographically secure state parameter generation and validation
 
 ## Installation
@@ -61,7 +61,7 @@ const
 
 # Use the authorization code grant with PKCE
 let client = newHttpClient()
-let response = waitFor client.authorizationCodeGrant(
+let response = client.authorizationCodeGrant(
   authorizeUrl,
   tokenUrl,
   clientId,
@@ -119,7 +119,7 @@ let callbackUri = "http://localhost:8080?code=abc123&state=" & state
 let authResponse = parseAuthorizationResponse(callbackUri)
 
 # Exchange code for access token
-let response = waitFor client.getAuthorizationCodeAccessToken(
+let response = client.getAuthorizationCodeAccessToken(
   tokenUrl,
   authResponse.code,
   clientId,
@@ -138,7 +138,7 @@ import oauth2
 import std/httpclient
 
 let client = newHttpClient()
-let response = waitFor client.clientCredsGrant(
+let response = client.clientCredsGrant(
   "https://example.com/oauth/token",
   clientId,
   clientSecret,
@@ -158,7 +158,7 @@ import oauth2
 import std/httpclient
 
 let client = newHttpClient()
-let response = waitFor client.resourceOwnerPassCredsGrant(
+let response = client.resourceOwnerPassCredsGrant(
   "https://example.com/oauth/token",
   clientId,
   clientSecret,
@@ -184,7 +184,7 @@ let tokenInfo = loadTokens("tokens.json")
 # Check if token is expired
 if isTokenExpired(tokenInfo):
   # Refresh the token
-  let response = waitFor client.refreshToken(
+  let response = client.refreshToken(
     "https://example.com/oauth/token",
     clientId,
     clientSecret,
@@ -212,13 +212,13 @@ let client = newHttpClient()
 let tokenInfo = loadTokens("tokens.json")
 
 # Make a GET request
-let response = waitFor client.bearerRequest(
+let response = client.bearerRequest(
   "https://api.example.com/user",
   tokenInfo.accessToken
 )
 
 # Make a POST request with body
-let postResponse = waitFor client.bearerRequest(
+let postResponse = client.bearerRequest(
   "https://api.example.com/data",
   tokenInfo.accessToken,
   httpMethod = HttpPOST,
