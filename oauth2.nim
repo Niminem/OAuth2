@@ -1,0 +1,265 @@
+import std/[uri, base64, random, cgi, tables, strtabs, strutils,
+    asynchttpserver, asyncdispatch, asyncnet, httpclient, browsers]
+
+{.warning[ImplicitDefaultValue]:off.} # disables warning for implicit default value in proc parameters
+
+type
+    GrantType = enum
+        AuthorizationCode = "authorization_code",
+        Implicit,
+        ResourceOwnerPassCreds = "password",
+        ClientCreds = "client_credentials",
+        RefreshToken = "refresh_token"
+
+    AuthorizationResponse* = ref object
+        code*, state*: string
+
+    AuthorizationError* = object of CatchableError
+        error*, errorDescription*, errorUri*, state*: string
+
+    RedirectUriParseError* = object of CatchableError
+
+proc setRequestHeaders(headers: HttpHeaders, body: string) =
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+    headers["Content-Length"] = $len(body)
+
+proc getGrantUrl(url, clientId: string, grantType: GrantType,
+    redirectUri, state: string, scope: openarray[string] = [], accessType: string): string =
+    var url = url
+    let parsed = parseUri(url)
+    url = url & (if parsed.query == "": "?" else: "&")
+    url = url & "response_type=" & (if grantType == AuthorizationCode: "code" else: "token") &
+      "&client_id=" & encodeUrl(clientId) & "&state=" & state
+    if len(redirectUri) > 0:
+        url = url & "&redirect_uri=" & encodeUrl(redirectUri)
+    if len(scope) > 0:
+        url = url & "&scope=" & encodeUrl(scope.join(" "))
+    if len(accessType) > 0:
+        url = url & "&access_type=" & encodeUrl(accessType)    
+    result = url
+
+proc getAuthorizationCodeGrantUrl*(url, clientId: string;
+    redirectUri: string = "", state: string = ""; scope: openarray[string] = [],
+    accessType: string = ""): string =
+    ## Returns the URL for sending authorization requests in "Authorization Code Grant" type.
+    result = getGrantUrl(url, clientId, AuthorizationCode, redirectUri, state, scope, accessType)
+
+proc getImplicitGrantUrl*(url, clientId: string;
+    redirectUri, state: string = ""; scope: openarray[string] = [];
+    accessType: string = ""): string =
+    ## Returns the URL for sending authorization requests in "Implicit Grant" type.
+    result = getGrantUrl(url, clientId, Implicit, redirectUri, state, scope, accessType)
+
+proc getBasicAuthorizationHeader*(clientId, clientSecret: string): HttpHeaders =
+    ## Returns a header necessary to basic authentication.
+    var auth = encode(clientId & ":" & clientSecret)
+    auth = auth.replace("\c\L", "")
+    result = newHttpHeaders({"Authorization": "Basic " & auth})
+
+proc getBasicAuthorizationHeader(clientId, clientSecret, body: string): HttpHeaders =
+    result = getBasicAuthorizationHeader(clientId, clientSecret)
+    result.setRequestHeaders(body)
+
+proc getBearerRequestHeader*(accessToken: string): HttpHeaders =
+    ## Returns a header necessary to bearer request.
+    result = newHttpHeaders({"Authorization": "Bearer " & accessToken})
+
+proc getBearerRequestHeader(accessToken: string,
+    extraHeaders: HttpHeaders, body: string): HttpHeaders =
+    result = getBearerRequestHeader(accessToken)
+    result.setRequestHeaders(body)
+    if extraHeaders != nil:
+      for k, v in extraHeaders.table:
+        result[k] = v
+
+proc accessTokenRequest(client: HttpClient | AsyncHttpClient,
+    url, clientId, clientSecret: string;
+    grantType: GrantType, useBasicAuth: bool;
+    code, redirectUri, username, password, refreshToken = "",
+    scope: seq[string] = @[]): Future[Response | AsyncResponse] {.multisync.} =
+    var body = "grant_type=" & $grantType
+    case grantType
+    of ResourceOwnerPassCreds:
+        body = body & "&username=" & username & "&password=" & password
+        if len(scope) > 0:
+            body = body & "&scope=" & encodeUrl(scope.join(" "))
+    of AuthorizationCode:
+        body = body & "&code=" & encodeUrl(code)
+        if len(redirectUri) > 0:
+            body = body & "&redirect_uri=" & encodeUrl(redirectUri)
+    of ClientCreds:
+        if len(scope) > 0:
+            body = body & "&scope=" & encodeUrl(scope.join(" "))
+    of RefreshToken:
+        body = body & "&refresh_token=" & encodeUrl(refreshToken)
+        if len(scope) > 0:
+            body = body & "&scope=" & encodeUrl(scope.join(" "))
+    else: discard
+
+    var header: HttpHeaders
+    if useBasicAuth:
+        header = getBasicAuthorizationHeader(clientId, clientSecret, body)
+    else:
+        body = body & "&client_id=" & encodeUrl(clientId) & "&client_secret=" & encodeUrl(clientSecret)
+        header = newHttpHeaders()
+        header.setRequestHeaders(body)
+
+    result = await client.request(url, httpMethod = HttpPOST, headers = header, body = body)
+
+proc getAuthorizationCodeAccessToken*(client: HttpClient | AsyncHttpClient,
+    url, code, clientId, clientSecret: string,
+    redirectUri: string = "", useBasicAuth: bool = true): Future[Response | AsyncResponse] {.multisync.}=
+    ## Send the access token request for "Authorization Code Grant" type.
+    result = await client.accessTokenRequest(url, clientId, clientSecret,
+        AuthorizationCode, useBasicAuth, code, redirectUri)
+
+# ref. https://github.com/nim-lang/Nim/blob/master/lib/pure/asynchttpserver.nim#L154
+proc getCallbackParamters(port: Port, html: string): Future[Uri] {.async.} =
+    let socket = newAsyncSocket()
+    socket.bindAddr(port)
+    socket.listen()
+
+    proc processClient(client: AsyncSocket): Future[string] {.async.} =
+        var request = Request()
+        request.headers = newHttpHeaders()
+        result = ""
+        while not client.isClosed:
+            assert client != nil
+            request.client = client
+            var line = await client.recvLine()
+            if line == "":
+                client.close()
+            else:
+                var url =line.split(" ")[1]
+                request.url = parseUri url
+                while true:
+                    line = await client.recvLine()
+                    if line == "\c\L":
+                        break
+                    let fd = line.find(":")
+                    request.headers[line[0..fd-1].strip()] = line[fd+1..len(line)-1].strip()
+                await request.respond(Http200, html)
+                result = url
+                client.close()
+
+    var url: string
+    while true:
+        var fut = await socket.acceptAddr()
+        url = await processClient(fut.client)
+        if len(url) > 0:
+            break
+    result = parseUri url
+
+proc generateState*(): string =
+    ## Generate a state.
+    var r = 0
+    result = ""
+    randomize()
+    for i in 0..4:
+        r = rand(25)
+        result = result & chr(97 + r)
+
+proc parseRedirectUri(body: string): StringTableRef =
+    let responses = body.split("&")
+    result = newStringTable(modeCaseInsensitive)
+    for response in responses:
+        let fd = response.find("=")
+        result[response[0..fd-1]] = response[fd+1..len(response)-1]
+
+proc parseAuthorizationResponse*(uri: Uri): AuthorizationResponse =
+    ## Parse an authorization response of "Authorization Code Grant" added to redirect uri.
+    let
+        query = uri.query
+        parsed = parseRedirectUri(query)
+    if parsed.hasKey("code"):
+        return AuthorizationResponse(code: parsed["code"], state: parsed["state"])
+    if parsed.hasKey("error"):
+        var error: ref AuthorizationError
+        new(error)
+        error.error = parsed["error"]
+        if parsed.hasKey("error_description"):
+            error.errorDescription = decodeUrl(parsed["error_description"])
+        if parsed.hasKey("error_uri"):
+            error.errorUri = decodeUrl(parsed["error_uri"])
+        error.state = parsed["state"]
+        raise error
+    raise newException(RedirectUriParseError, "Failed to parse a redirect uri.")
+
+proc parseAuthorizationResponse*(uri: string): AuthorizationResponse =
+    uri.parseUri().parseAuthorizationResponse()
+
+proc authorizationCodeGrant*(client: HttpClient | AsyncHttpClient,
+    authorizeUrl, accessTokenRequestUrl, clientId, clientSecret: string,
+    html: string = "", scope: seq[string] = @[],
+    port: int = 8080): Future[Response | AsyncResponse] {.multisync.} =
+    ## Send a request for "Authorization Code Grant" type.
+    ## | This method, outputs a URL for the authorization request at first.
+    ## | Then, wait for the callback at "http://localhost:${port}".
+    ## | When receiving the callback, check the state, and request an access token to the server.
+    ## | Returns the request result of the access token.
+    let
+        state = generateState()
+        redirectUri = "http://localhost:" & $port
+        authorizeUrl = getAuthorizationCodeGrantUrl(authorizeUrl, clientId, redirectUri, state, scope)
+
+    openDefaultBrowser(authorizeUrl)
+    let
+        uri = waitFor getCallbackParamters(Port(port), html)
+        params = parseRedirectUri(uri.query)
+    assert params["state"] == state
+    result = await client.getAuthorizationCodeAccessToken(accessTokenRequestUrl, params["code"],
+        clientId, clientSecret, redirectUri)
+
+proc implicitGrant*(url, clientId: string, html: string = "",
+    scope: openarray[string] = [], port: int = 8080): string {.deprecated.} =
+    ## Send a request for "Implicit Grant" type.
+    ## | This method, outputs a URL for the authorization request at first.
+    ## | Then, wait for the callback at "http://localhost:${port}".
+    ## | When receiving the callback, check the state, returns the Uri.query as a result.
+    let
+        state = generateState()
+        redirectUri = "http://localhost:" & $port
+        url = getImplicitGrantUrl(url, clientId, redirectUri, state, scope)
+
+    echo url
+    let
+        uri = waitFor getCallbackParamters(Port(port), html)
+        query = uri.query
+        params = parseRedirectUri(query)
+    assert params["state"] == state
+    result = query
+
+proc resourceOwnerPassCredsGrant*(client: HttpClient | AsyncHttpClient,
+    url, clientId, clientSecret, username, password: string,
+    scope: seq[string] = @[],
+    useBasicAuth: bool = true): Future[Response | AsyncResponse] {.multisync.} =
+    ## Send a request for "Resource Owner Password Credentials Grant" type.
+    ##
+    ##  | The client MUST discard the credentials once an access token has been obtained.
+    ##  | -- https://tools.ietf.org/html/rfc6749#section-4.3
+    result = await client.accessTokenRequest(url, clientId, clientSecret, ResourceOwnerPassCreds,
+        useBasicAuth, username = username, password = password, scope = scope)
+
+proc clientCredsGrant*(client: HttpClient | AsyncHttpClient,
+    url, clientid, clientsecret: string,
+    scope: seq[string] = @[],
+    useBasicAuth: bool = true): Future[Response | AsyncResponse] {.multisync.} =
+    ## Send a request for "Client Credentials Grant" type.
+    result = await client.accessTokenRequest(url, clientId, clientSecret, ClientCreds,
+        useBasicAuth, scope = scope)
+
+proc refreshToken*(client: HttpClient | AsyncHttpClient,
+    url, clientId, clientSecret, refreshToken: string,
+    scope: seq[string] = @[],
+    useBasicAuth: bool = true): Future[Response | AsyncResponse] {.multisync.} =
+    ## Send an update request of the access token.
+    result = await client.accessTokenRequest(url, clientId, clientSecret, RefreshToken,
+        useBasicAuth, refreshToken = refreshToken, scope = scope)
+
+proc bearerRequest*(client: HttpClient | AsyncHttpClient,
+    url, accessToken: string, httpMethod = HttpGET,
+    extraHeaders: HttpHeaders = nil,
+    body = ""): Future[Response | AsyncResponse] {.multisync.} =
+    ## Send a request using the bearer token.
+    let header = getBearerRequestHeader(accessToken, extraHeaders, body)
+    result = await client.request(url, httpMethod = httpMethod, headers = header, body = body)
