@@ -1,12 +1,14 @@
-import std/[uri, base64, random, cgi, tables, strtabs, strutils,
-    asynchttpserver, asyncdispatch, asyncnet, httpclient, browsers]
+import std/[uri, base64, sysrand, strtabs, strutils, asynchttpserver,
+            asyncdispatch, asyncnet, httpclient, browsers]
+import pkg/checksums/sha2
+import utils
+export utils
 
 {.warning[ImplicitDefaultValue]:off.} # disables warning for implicit default value in proc parameters
 
 type
     GrantType = enum
         AuthorizationCode = "authorization_code",
-        Implicit,
         ResourceOwnerPassCreds = "password",
         ClientCreds = "client_credentials",
         RefreshToken = "refresh_token"
@@ -19,36 +21,36 @@ type
 
     RedirectUriParseError* = object of CatchableError
 
+const UrlSafeChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+
 proc setRequestHeaders(headers: HttpHeaders, body: string) =
     headers["Content-Type"] = "application/x-www-form-urlencoded"
     headers["Content-Length"] = $len(body)
 
 proc getGrantUrl(url, clientId: string, grantType: GrantType,
-    redirectUri, state: string, scope: openarray[string] = [], accessType: string): string =
+    redirectUri, state: string, scope: openarray[string] = [], accessType: string,
+    codeChallenge: string = ""): string =
     var url = url
     let parsed = parseUri(url)
     url = url & (if parsed.query == "": "?" else: "&")
-    url = url & "response_type=" & (if grantType == AuthorizationCode: "code" else: "token") &
-      "&client_id=" & encodeUrl(clientId) & "&state=" & state
+    url = url & "response_type=code" &
+      "&client_id=" & encodeUrl(clientId) & "&state=" & encodeUrl(state)
     if len(redirectUri) > 0:
         url = url & "&redirect_uri=" & encodeUrl(redirectUri)
     if len(scope) > 0:
         url = url & "&scope=" & encodeUrl(scope.join(" "))
     if len(accessType) > 0:
-        url = url & "&access_type=" & encodeUrl(accessType)    
+        url = url & "&access_type=" & encodeUrl(accessType)
+    if len(codeChallenge) > 0:
+        url = url & "&code_challenge=" & encodeUrl(codeChallenge) & "&code_challenge_method=S256"
     result = url
 
 proc getAuthorizationCodeGrantUrl*(url, clientId: string;
     redirectUri: string = "", state: string = ""; scope: openarray[string] = [],
-    accessType: string = ""): string =
+    accessType: string = "", codeChallenge: string = ""): string =
     ## Returns the URL for sending authorization requests in "Authorization Code Grant" type.
-    result = getGrantUrl(url, clientId, AuthorizationCode, redirectUri, state, scope, accessType)
-
-proc getImplicitGrantUrl*(url, clientId: string;
-    redirectUri, state: string = ""; scope: openarray[string] = [];
-    accessType: string = ""): string =
-    ## Returns the URL for sending authorization requests in "Implicit Grant" type.
-    result = getGrantUrl(url, clientId, Implicit, redirectUri, state, scope, accessType)
+    ## If codeChallenge is provided, PKCE will be used (RFC 7636).
+    result = getGrantUrl(url, clientId, AuthorizationCode, redirectUri, state, scope, accessType, codeChallenge)
 
 proc getBasicAuthorizationHeader*(clientId, clientSecret: string): HttpHeaders =
     ## Returns a header necessary to basic authentication.
@@ -69,24 +71,26 @@ proc getBearerRequestHeader(accessToken: string,
     result = getBearerRequestHeader(accessToken)
     result.setRequestHeaders(body)
     if extraHeaders != nil:
-      for k, v in extraHeaders.table:
+      for k, v in pairs(extraHeaders):
         result[k] = v
 
 proc accessTokenRequest(client: HttpClient | AsyncHttpClient,
     url, clientId, clientSecret: string;
     grantType: GrantType, useBasicAuth: bool;
     code, redirectUri, username, password, refreshToken = "",
-    scope: seq[string] = @[]): Future[Response | AsyncResponse] {.multisync.} =
+    scope: seq[string] = @[], codeVerifier: string = ""): Future[Response | AsyncResponse] {.multisync.} =
     var body = "grant_type=" & $grantType
     case grantType
     of ResourceOwnerPassCreds:
-        body = body & "&username=" & username & "&password=" & password
+        body = body & "&username=" & encodeUrl(username) & "&password=" & encodeUrl(password)
         if len(scope) > 0:
             body = body & "&scope=" & encodeUrl(scope.join(" "))
     of AuthorizationCode:
         body = body & "&code=" & encodeUrl(code)
         if len(redirectUri) > 0:
             body = body & "&redirect_uri=" & encodeUrl(redirectUri)
+        if len(codeVerifier) > 0:
+            body = body & "&code_verifier=" & encodeUrl(codeVerifier)
     of ClientCreds:
         if len(scope) > 0:
             body = body & "&scope=" & encodeUrl(scope.join(" "))
@@ -94,7 +98,6 @@ proc accessTokenRequest(client: HttpClient | AsyncHttpClient,
         body = body & "&refresh_token=" & encodeUrl(refreshToken)
         if len(scope) > 0:
             body = body & "&scope=" & encodeUrl(scope.join(" "))
-    else: discard
 
     var header: HttpHeaders
     if useBasicAuth:
@@ -108,13 +111,14 @@ proc accessTokenRequest(client: HttpClient | AsyncHttpClient,
 
 proc getAuthorizationCodeAccessToken*(client: HttpClient | AsyncHttpClient,
     url, code, clientId, clientSecret: string,
-    redirectUri: string = "", useBasicAuth: bool = true): Future[Response | AsyncResponse] {.multisync.}=
+    redirectUri: string = "", useBasicAuth: bool = true, codeVerifier: string = ""): Future[Response | AsyncResponse] {.multisync.}=
     ## Send the access token request for "Authorization Code Grant" type.
+    ## If codeVerifier is provided, PKCE will be used (RFC 7636).
     result = await client.accessTokenRequest(url, clientId, clientSecret,
-        AuthorizationCode, useBasicAuth, code, redirectUri)
+        AuthorizationCode, useBasicAuth, code, redirectUri, codeVerifier = codeVerifier)
 
 # ref. https://github.com/nim-lang/Nim/blob/master/lib/pure/asynchttpserver.nim#L154
-proc getCallbackParamters(port: Port, html: string): Future[Uri] {.async.} =
+proc getCallbackParameters(port: Port, html: string): Future[Uri] {.async.} =
     let socket = newAsyncSocket()
     socket.bindAddr(port)
     socket.listen()
@@ -124,13 +128,13 @@ proc getCallbackParamters(port: Port, html: string): Future[Uri] {.async.} =
         request.headers = newHttpHeaders()
         result = ""
         while not client.isClosed:
-            assert client != nil
+            doAssert client != nil
             request.client = client
             var line = await client.recvLine()
             if line == "":
                 client.close()
             else:
-                var url =line.split(" ")[1]
+                var url = line.split(" ")[1]
                 request.url = parseUri url
                 while true:
                     line = await client.recvLine()
@@ -141,7 +145,6 @@ proc getCallbackParamters(port: Port, html: string): Future[Uri] {.async.} =
                 await request.respond(Http200, html)
                 result = url
                 client.close()
-
     var url: string
     while true:
         var fut = await socket.acceptAddr()
@@ -151,20 +154,48 @@ proc getCallbackParamters(port: Port, html: string): Future[Uri] {.async.} =
     result = parseUri url
 
 proc generateState*(): string =
-    ## Generate a state.
-    var r = 0
-    result = ""
-    randomize()
-    for i in 0..4:
-        r = rand(25)
-        result = result & chr(97 + r)
+    ## Generate a cryptographically secure state parameter for OAuth2 flows.
+    result = newString(32)
+    let randomBytes = urandom(32)
+    for i in 0..31:
+        result[i] = UrlSafeChars[int(randomBytes[i]) mod UrlSafeChars.len]
+
+proc generatePKCE*(): tuple[codeVerifier: string, codeChallenge: string] =
+    ## Generate PKCE code verifier and challenge.
+    ## Returns a tuple with code_verifier and code_challenge (base64url-encoded SHA256 hash).
+    ## The code_verifier is a cryptographically random string of 43-128 characters.
+    # Generate 43-128 characters, using 64 for good security/performance balance
+    # Use urandom for cryptographically secure randomness
+    var codeVerifier = newString(64)
+    let randomBytes = urandom(64)
+    for i in 0..63:
+        codeVerifier[i] = UrlSafeChars[int(randomBytes[i]) mod UrlSafeChars.len]
+    
+    # Compute SHA256 hash and base64url encode
+    var hasher = initSha_256()
+    hasher.update(codeVerifier)
+    let digest = hasher.digest()
+    var codeChallenge = encode(digest, safe = true)
+    # Remove padding (RFC 4648 Section 3.2 - base64url omits padding)
+    codeChallenge = codeChallenge.replace("=", "")
+    
+    result = (codeVerifier: codeVerifier, codeChallenge: codeChallenge)
 
 proc parseRedirectUri(body: string): StringTableRef =
     let responses = body.split("&")
     result = newStringTable(modeCaseInsensitive)
     for response in responses:
+        if response.len == 0:
+            continue
         let fd = response.find("=")
-        result[response[0..fd-1]] = response[fd+1..len(response)-1]
+        if fd > 0 and fd < response.len - 1:
+            let key = response[0..fd-1]
+            let value = decodeUrl(response[fd+1..^1])
+            result[key] = value
+        elif fd > 0:
+            # Handle case where value is empty (key=)
+            let key = response[0..fd-1]
+            result[key] = ""
 
 proc parseAuthorizationResponse*(uri: Uri): AuthorizationResponse =
     ## Parse an authorization response of "Authorization Code Grant" added to redirect uri.
@@ -191,43 +222,36 @@ proc parseAuthorizationResponse*(uri: string): AuthorizationResponse =
 proc authorizationCodeGrant*(client: HttpClient | AsyncHttpClient,
     authorizeUrl, accessTokenRequestUrl, clientId, clientSecret: string,
     html: string = "", scope: seq[string] = @[],
-    port: int = 8080): Future[Response | AsyncResponse] {.multisync.} =
+    port: int = 8080, usePKCE: bool = false): Future[Response | AsyncResponse] {.multisync.} =
     ## Send a request for "Authorization Code Grant" type.
     ## | This method, outputs a URL for the authorization request at first.
     ## | Then, wait for the callback at "http://localhost:${port}".
     ## | When receiving the callback, check the state, and request an access token to the server.
     ## | Returns the request result of the access token.
+    ## | If usePKCE is true, PKCE (RFC 7636) will be used for enhanced security.
     let
         state = generateState()
         redirectUri = "http://localhost:" & $port
-        authorizeUrl = getAuthorizationCodeGrantUrl(authorizeUrl, clientId, redirectUri, state, scope)
+        pkce = if usePKCE: generatePKCE() else: (codeVerifier: "", codeChallenge: "")
+        authUrl = getAuthorizationCodeGrantUrl(authorizeUrl, clientId, redirectUri, state, scope, 
+                                                codeChallenge = pkce.codeChallenge)
 
-    openDefaultBrowser(authorizeUrl)
+    openDefaultBrowser(authUrl)
     let
-        uri = waitFor getCallbackParamters(Port(port), html)
+        uri = waitFor getCallbackParameters(Port(port), html)
         params = parseRedirectUri(uri.query)
-    assert params["state"] == state
+    if not params.hasKey("state") or params["state"] != state:
+        var error: ref AuthorizationError
+        new(error)
+        error.msg = "State mismatch in authorization response"
+        error.error = "invalid_state"
+        error.state = if params.hasKey("state"): params["state"] else: ""
+        raise error
+    if not params.hasKey("code"):
+        raise newException(RedirectUriParseError, "Missing authorization code in redirect URI")
     result = await client.getAuthorizationCodeAccessToken(accessTokenRequestUrl, params["code"],
-        clientId, clientSecret, redirectUri)
+        clientId, clientSecret, redirectUri, codeVerifier = pkce.codeVerifier)
 
-proc implicitGrant*(url, clientId: string, html: string = "",
-    scope: openarray[string] = [], port: int = 8080): string {.deprecated.} =
-    ## Send a request for "Implicit Grant" type.
-    ## | This method, outputs a URL for the authorization request at first.
-    ## | Then, wait for the callback at "http://localhost:${port}".
-    ## | When receiving the callback, check the state, returns the Uri.query as a result.
-    let
-        state = generateState()
-        redirectUri = "http://localhost:" & $port
-        url = getImplicitGrantUrl(url, clientId, redirectUri, state, scope)
-
-    echo url
-    let
-        uri = waitFor getCallbackParamters(Port(port), html)
-        query = uri.query
-        params = parseRedirectUri(query)
-    assert params["state"] == state
-    result = query
 
 proc resourceOwnerPassCredsGrant*(client: HttpClient | AsyncHttpClient,
     url, clientId, clientSecret, username, password: string,
@@ -241,7 +265,7 @@ proc resourceOwnerPassCredsGrant*(client: HttpClient | AsyncHttpClient,
         useBasicAuth, username = username, password = password, scope = scope)
 
 proc clientCredsGrant*(client: HttpClient | AsyncHttpClient,
-    url, clientid, clientsecret: string,
+    url, clientId, clientSecret: string,
     scope: seq[string] = @[],
     useBasicAuth: bool = true): Future[Response | AsyncResponse] {.multisync.} =
     ## Send a request for "Client Credentials Grant" type.
