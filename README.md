@@ -39,11 +39,6 @@ cd OAuth2
 nimble install
 ```
 
-## Requirements
-
-- Nim >= 2.2.4
-- `checksums` package (for PKCE SHA256 hashing)
-
 ## Quick Start
 
 ### Authorization Code Grant (with PKCE)
