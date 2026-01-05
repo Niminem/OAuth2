@@ -25,10 +25,10 @@ This library provides a complete implementation of the OAuth2 authorization fram
 
 ## Installation
 
-Since this package is not yet published on Nimble, you can install it directly from GitHub:
+Install from Nimble:
 
 ```bash
-nimble install https://github.com/Niminem/OAuth2.git
+nimble install oauth2
 ```
 
 Alternatively, you can clone the repository and install:
